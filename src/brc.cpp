@@ -1,174 +1,220 @@
 
 #include <unistd.h>
 #include <fcntl.h>
-#include <chrono>
 #include <iostream>
 #include <string>
 #include <map>
-#include <atomic>
 #include <memory>
 #include <optional>
+#include <errno.h>
 #include <thread>
 #include <queue>
-#include <queue>
+
+const size_t buffer_size = 4096; // the best size for perf
 
 struct Station {
     float min;
     float max;
     float sum;
     int count;
+    std::shared_ptr<std::mutex> mtx;
 };
 
 struct Record {
     std::string name;
     float data;
 };
-template<typename t>
-class Queue {
-    private:
-        std::queue<t> _data;
-        std::mutex _mtx;
-    public:
-        void push(t val) {
-            _mtx.lock();
-            _data.push(val);
-            _mtx.unlock();
-        }
-        std::optional<t> pop() {
-            _mtx.lock();
-            if (_data.size() <= 0) {
-                return std::nullopt;
-            }
-            t ret_val = _data.back();
-            _data.pop();
-            _mtx.unlock();
-            return ret_val;
-        }
-};
 
-typedef Queue<char* > in_channel;
-typedef Queue<Record* > out_channel;
-class Worker {
-    public:
-        Worker() {
-
-        }
-        Worker(std::shared_ptr<in_channel> read_channel, std::shared_ptr<out_channel> write_channel) {
-            this->read_channel = read_channel;
-            this->write_channel = write_channel;
-        }
-        void operator() () {
-            char data;
-            char* buffer;
-            char* ptr;
-            float val;
-            char* start;
-            Record* rec;
-            std::string name;
-            do {
-                std::optional<char*> data =  read_channel->pop();
-                buffer = data.value_or(nullptr);
-                if (buffer == nullptr) continue;
-                std::cout << buffer << std::endl;
-                if (*buffer == 0) break;
-                
-                for (ptr = buffer; *ptr != 0; ptr ++) {
-                    switch (*ptr) {
-                    case '\n': 
-                        *ptr = 0;
-                        val = atof(start);
-                        start = ptr + sizeof(char);
-                        rec = (Record*) malloc(sizeof(Record));
-                        rec->name = name;
-                        rec->data = val;
-                        write_channel->push(rec);
-                        break;
-                    case ';': 
-                        *ptr = 0;
-                        name = start;
-                        start = ptr + sizeof(char);
-                       break;
-                    default:
-                        break;
-                    }
-                }
-                std::cout << buffer << std::endl;
-                free(buffer);
-            } while(true);
-            rec = (Record*)malloc(sizeof(Record));
-            rec->data = 0;
-            rec->name = "";
-            write_channel->push(rec);
-        }
-    private: 
-        std::shared_ptr<in_channel> read_channel;
-        std::shared_ptr<out_channel> write_channel;
-};
-
-int main (int argc, char** argv) {
-    const size_t buffer_size = 4096; //the best size for perf
+class Reader
+{
+private:
     bool eof = false;
-    char* buffer = (char*) malloc(buffer_size + 1);
-    char* next_buffer;
-    char* tmp;
-    buffer[buffer_size] = 0;
+    char *overflow_buffer;
+    size_t overflow;
     int len;
-    int overflow = 0;
-    int fd = open("measurements.txt",O_RDONLY);
+    int fd;
+    std::mutex *mtx;
+
+public:
+    Reader()
+    {
+        std::cout << "Reader Alloc" << std::endl;
+        overflow_buffer = (char *)calloc(0, buffer_size + 1);
+        mtx = new std::mutex();
+        fd = open("measurements.txt", O_RDONLY);
+    }
+
+    ~Reader()
+    {
+        std::cout << "Reader DeAlloc" << std::endl;
+        free(overflow_buffer);
+        delete mtx;
+        close(fd);
+    }
+
+    void read_next(char *buffer)
+    {
+        mtx->lock();
+        memset(buffer, 0, buffer_size);
+        if (eof)
+            return;
+        memcpy(buffer, overflow_buffer, overflow);
+        len = read(fd, buffer + overflow, buffer_size - overflow);
+        eof = (len < buffer_size - overflow);
+        for (overflow = 0; buffer[buffer_size - overflow] != '\n'; overflow++)
+            ;
+        memset(overflow_buffer, 0, buffer_size);
+        memcpy(overflow_buffer, buffer + buffer_size - overflow, overflow);
+        memset(buffer + buffer_size - overflow, 0, overflow);
+        std::cout << "TEST 2 " << (void *)buffer << std::endl;
+        mtx->unlock();
+    }
+};
+
+class Catalog
+{
+private:
     std::map<std::string, Station> stations;
-    std::map<std::string, Station>::iterator point;
-    std::shared_ptr<in_channel> write_channel(new in_channel());
-    std::shared_ptr<out_channel> read_channel(new out_channel());
+    std::mutex *_mtx;
+
+public:
+    Catalog()
+    {
+        std::cout << "Catalog Alloc" << std::endl;
+        _mtx = new std::mutex();
+    }
+
+    ~Catalog()
+    {
+        std::cout << "Catalog DeAlloc" << std::endl;
+        delete _mtx;
+    }
+
+    void update(std::string name, float val)
+    {
+        std::map<std::string, Station>::iterator point;
+        point = stations.find(name);
+        if (point == stations.end())
+        {
+            _mtx->lock();
+            point = stations.find(name);
+            if (point != stations.end())
+            {
+                _mtx->unlock();
+                return this->update(name, val);
+            }
+            stations[name] = (Station){val, val, val, 1, std::shared_ptr<std::mutex>(new std::mutex())};
+            _mtx->unlock();
+        }
+        else
+        {
+            point->second.mtx->lock();
+            point->second.max = (point->second.max < val) ? val : point->second.max;
+            point->second.min = (point->second.min < val) ? val : point->second.min;
+            point->second.sum += val;
+            point->second.count++;
+            point->second.mtx->unlock();
+        }
+    }
+
+    void
+    print()
+    {
+        std::cout << "{";
+        for (std::map<std::string, Station>::iterator itr = stations.begin(); itr != stations.end(); itr++)
+        {
+            std::cout << itr->first << "=" << std::floor(itr->second.min * 10) / 10 << "/" << std::floor(itr->second.max * 10) / 10 << "/" << std::floor((itr->second.sum / itr->second.count) * 10) / 10 << ",";
+        }
+        std::cout << "}" << std::endl;
+    }
+};
+
+class Worker
+{
+public:
+    Worker(Reader *reader, Catalog *catalog)
+    {
+        std::cout << "Worker Alloc" << std::endl;
+        this->reader = reader;
+        this->catalog = catalog;
+        this->buffer = (char *)calloc(0, buffer_size + 1);
+        std::cout << "TEST 1" << (void *)this->buffer << std::endl;
+    }
+
+    ~Worker()
+    {
+        std::cout << "Worker DeAlloc" << std::endl;
+        if (buffer != nullptr)
+        {
+            free(this->buffer);
+        }
+    }
+    void operator()()
+    {
+        char data;
+        char *ptr;
+        float val;
+        char *start;
+        Record *rec;
+        std::string name;
+        do
+        {
+            reader->read_next(this->buffer);
+            std::cout << "TEST 2" << (void *)this->buffer << std::endl;
+            if (this->buffer != nullptr || (*(this->buffer)) == 0)
+                break;
+            start = this->buffer;
+            for (ptr = this->buffer; *ptr != 0; ptr++)
+            {
+                switch (*ptr)
+                {
+                case '\n':
+                    *ptr = 0;
+                    val = atof(start);
+                    start = ptr + sizeof(char);
+                    catalog->update(name, val);
+                    break;
+                case ';':
+                    *ptr = 0;
+                    name = start;
+                    start = ptr + sizeof(char);
+                    break;
+                default:
+                    break;
+                }
+            }
+        } while (true);
+    }
+
+private:
+    char *buffer = nullptr;
+    Reader *reader;
+    Catalog *catalog;
+};
+
+int main(int argc, char **argv)
+{
+    int fd = open("measurements.txt", O_RDONLY);
+    Reader *reader = new Reader();
+    Catalog *catalog = new Catalog();
 
     size_t worker_count = 4;
-    Worker workers[worker_count];
+    Worker *workers[worker_count];
     std::thread threads[worker_count];
-    for (int i = 0; i < worker_count; i++) {
-        workers[i] = Worker(write_channel,read_channel);
-        threads[i] = std::thread(workers[i]);
+    for (int i = 0; i < worker_count; i++)
+    {
+        workers[i] = new Worker(reader, catalog);
+        threads[i] = std::thread(*workers[i]);
     }
 
-    do {
-        len = read(fd,buffer+ overflow,buffer_size - overflow);
-        eof = (len < buffer_size - overflow);
-        for(overflow = 0; buffer[buffer_size - 1 - overflow] != '\n'; overflow++);
-        next_buffer = (char*) malloc(buffer_size);
-        memcpy(next_buffer,buffer + buffer_size - overflow, overflow);
-        memset(buffer + buffer_size - overflow,0,overflow);
-        write_channel->push(buffer);
-        buffer = next_buffer;
-    }while(!eof);
-
-    for (int i = 0; i < worker_count; i++) write_channel->push("");
-
-    int count = 0;
-    Record* rec; 
-    while(true) {
-        std::optional<Record*> data = read_channel->pop();
-        rec = data.value_or(nullptr);
-        if (!rec) continue;
-        if (rec->name.empty()) {
-            count++;
-            if (count >= worker_count ) break;
-            continue;
-        }
-        std::cout << std::endl;
-        point = stations.find(rec->name);
-        if (point == stations.end()) {
-            stations.insert(std::make_pair(rec->name,(Station){rec->data,rec->data,rec->data,1}));
-        } else {
-            point->second.max = (point->second.max < rec->data) ? rec->data : point->second.max;
-            point->second.min = (point->second.min < rec->data) ? rec->data : point->second.min;
-            point->second.sum += rec->data;
-            point->second.count++;
-        }
-        free(rec);
+    for (int i = 0; i < worker_count; i++)
+    {
+        threads[i].join();
+        delete workers[i];
     }
 
-    std::cout << "{";
+    catalog->print();
 
-    for (std::map<std::string, Station>::iterator itr = stations.begin(); itr != stations.end(); itr ++) {
-        std::cout << itr->first << "=" << std::floor(itr->second.min * 10)/10 << "/" << std::floor(itr->second.max * 10)/10 << "/" << std::floor((itr->second.sum/ itr->second.count) * 10)/10 << ",";
-    }
-    std::cout << "}" << std::endl;
+    delete reader;
+    delete catalog;
 }

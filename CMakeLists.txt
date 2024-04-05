@@ -9,6 +9,8 @@ INCLUDE_DIRECTORIES( ${Boost_INCLUDE_DIR} )
 
 add_executable(${PROJECT_NAME} src/brc.cpp)
 
+target_include_directories(${PROJECT_NAME} PUBLIC inc)
+
 target_link_libraries(${PROJECT_NAME} LINK_PUBLIC ${Boost_LIBRARIES})
 
 find_package(Java REQUIRED)
